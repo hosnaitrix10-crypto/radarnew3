@@ -1,0 +1,42 @@
+name: Atualizar dados do Radar
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 21:00 UTC = 18:00 em Brasília (UTC-3), dias úteis.
+    - cron: "0 21 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: atualizar-dados-radar
+  cancel-in-progress: false
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+      - name: Coletar catálogo e dados de mercado
+        run: python -u coleta.py
+      - name: Publicar dados
+        run: |
+          git config user.name "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add dados.json catalogo_ativos.json
+          if git diff --cached --quiet; then
+            echo "Sem alterações nos dados."
+          else
+            git commit -m "Atualiza catálogo e dados do Radar"
+            git push
+          fi
