@@ -1,0 +1,4 @@
+pandas>=2.2,<3.0
+lxml>=5.0
+requests>=2.31
+yfinance>=0.2.50
