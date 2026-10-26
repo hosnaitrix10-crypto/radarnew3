@@ -35,39 +35,84 @@ def numero(v):
 
 
 def ticker_from(text):
+    """Extrai ticker do início da célula, inclusive quando o nome vem colado.
+
+    O CotaLab apresenta tickers como AALR3, A1AP34, 03BK11 e 3PRE11
+    concatenados diretamente com o nome da empresa. Não exigir espaço/separador.
+    """
     s=str(text).strip().upper()
-    # Em algumas tabelas o HTML concatena ticker e nome sem espaço (ex.: AAPL34Apple Inc.).
-    m=re.match(r'^([A-Z]{4}\d{1,2}|\d{2}[A-Z]{2}\d{2})(?=$|[^A-Z0-9]|[A-Z])',s)
-    if m:return m.group(1)
-    m=re.match(r'^([A-Z0-9]{4,6})$',s)
-    return m.group(1) if m else None
+    # Formatos comuns B3: letras + dígitos, mistos com prefixo numérico,
+    # e tickers iniciados por letra-dígito (ex.: A1AP34). A ordem importa.
+    patterns=(
+        r'^([A-Z]{4}\d{1,2})',       # PETR4, ISAE4, AALR3, ABCB10
+        r'^([A-Z]\d[A-Z]{2}\d{2})', # A1AP34, B1AM34
+        r'^(\d{2}[A-Z]{2}\d{2})',  # 03BK11
+        r'^([A-Z]{3}\d{2})',         # tickers especiais de 5 caracteres
+        r'^(\d[A-Z]{3}\d{2})',    # 3PRE11
+        r'^([A-Z]{2,4}\d{2})',       # outros formatos com sufixo numérico
+    )
+    for pattern in patterns:
+        m=re.match(pattern,s)
+        if m:
+            return m.group(1)
+    # Em fontes que trazem o ticker numa célula separada.
+    if re.fullmatch(r'[A-Z0-9]{4,6}',s):
+        return s
+    return None
 
 
 def parse_catalog_table(table):
-    df=table.copy(); df.columns=[str(c).strip().lower() for c in df.columns]
+    df=table.copy()
+    df.columns=[str(c).strip().lower() for c in df.columns]
     out=[]
+    # Identifica colunas pela estrutura real da tabela; as células de ticker e nome
+    # podem estar concatenadas (ex.: A1AP34Apple Inc.).
+    ticker_col=next((c for c in df.columns if 'ticker' in c or 'papel' in c),df.columns[0] if len(df.columns) else None)
+    name_col=next((c for c in df.columns if 'nome' in c or 'empresa' in c),None)
+    cat_col=next((c for c in df.columns if 'categoria' in c or 'tipo' in c),None)
+    sector_col=next((c for c in df.columns if 'setor' in c),None)
+    category_map={
+        'acao':'acao','acoes':'acao','ação':'acao','ações':'acao',
+        'fii':'fii','fiis':'fii','fundo imobiliario':'fii','fundos imobiliarios':'fii',
+        'etf':'etf','etfs':'etf','fundo de indice':'etf','fundos de indice':'etf',
+        'bdr':'bdr','bdrs':'bdr','brazilian depositary receipt':'bdr',
+    }
+    def category_for(value):
+        v=re.sub(r'\s+',' ',str(value or '').strip().lower())
+        if v in category_map: return category_map[v]
+        # Aceita rótulos mais longos, sem confundir setor/nome com categoria.
+        for label,cat in [('acoes','acao'),('ações','acao'),('ação','acao'),('acao','acao'),
+                          ('fiis','fii'),('fii','fii'),('etfs','etf'),('etf','etf'),
+                          ('bdrs','bdr'),('bdr','bdr')]:
+            if v==label or v.startswith(label+' '): return cat
+        return None
     for _,row in df.iterrows():
         vals=[str(x).strip() for x in row.tolist() if x is not None and str(x).strip() not in {'','nan','None'}]
         if not vals: continue
-        ticker=None; ticker_cell=''
-        for v in vals:
-            t=ticker_from(v)
-            if t: ticker=t; ticker_cell=v; break
+        ticker_cell=str(row[ticker_col]).strip() if ticker_col is not None and pd.notna(row[ticker_col]) else ''
+        ticker=ticker_from(ticker_cell)
+        # Não procure ticker nas demais células: isso pode interpretar rótulos
+        # como 'acoes'/'etfs' como se fossem símbolos quando a célula principal
+        # tiver formato inesperado. Falha fechada e deixa a validação sinalizar.
         if not ticker: continue
-        joined=' | '.join(vals).lower()
-        cat=None
-        for needle,canon in [('acoes','acao'),('ações','acao'),('fiis','fii'),('etfs','etf'),('bdrs','bdr')]:
-            if needle in joined: cat=canon; break
+        cat=category_for(row[cat_col]) if cat_col is not None else None
+        if not cat:
+            # Fallback para HTML sem cabeçalhos consistentes: só categorias exatas.
+            for v in vals:
+                cat=category_for(v)
+                if cat: break
         if not cat: continue
         nome=''
-        if ticker_cell.upper()!=ticker:
+        if name_col is not None and pd.notna(row[name_col]):
+            nome=str(row[name_col]).strip()
+        if not nome and ticker_cell.upper()!=ticker:
             nome=re.sub(r'^'+re.escape(ticker)+r'\s*','',ticker_cell,flags=re.I).strip(' -–|')
         if not nome:
             for v in vals:
-                if v!=ticker_cell and not any(x in v.lower() for x in ['acoes','ações','fiis','etfs','bdrs']):
-                    if not re.fullmatch(r'[A-Z]{2,4}',v.strip()): nome=v; break
-        setor=vals[-1] if len(vals)>2 else ''
-        if setor.lower() in {'acoes','ações','fiis','etfs','bdrs'}: setor=''
+                if v!=ticker_cell and not category_for(v) and not re.fullmatch(r'[A-Z]{2,4}',v.strip()):
+                    nome=v; break
+        setor=str(row[sector_col]).strip() if sector_col is not None and pd.notna(row[sector_col]) else ''
+        if setor in {'—','-','nan','None'}: setor=''
         out.append({'t':ticker,'nome':nome or ticker,'cat':cat,'setor':setor,'fonte_catalogo':'CotaLab'})
     return out
 
@@ -81,8 +126,19 @@ def carregar_catalogo():
         if r.status_code==404 and pagina>1: break
         r.raise_for_status()
         texto=r.text
+        # A paginação pode estar no rodapé textual, nos links ou no resumo
+        # 'Mostrando 1–80 de 1941 ativos'. Tenta todas as formas conhecidas;
+        # sem isso o coletor acha só a primeira página (80 linhas) e aborta.
+        paginas_encontradas=[]
         m=re.search(r'Página\s*\d+\s*de\s*(\d+)',texto,re.I)
-        if m: total_pag=min(MAX_PAGINAS,int(m.group(1)))
+        if m: paginas_encontradas.append(int(m.group(1)))
+        paginas_encontradas += [int(x) for x in re.findall(r'/ativos/pagina/(\d+)',texto,re.I)]
+        m_total=re.search(r'Mostrando\s+\d+\s*[–-]\s*\d+\s+de\s+([\d.,]+)\s+ativos',texto,re.I)
+        if m_total:
+            total_ativos=int(re.sub(r'[^0-9]','',m_total.group(1)))
+            paginas_encontradas.append(math.ceil(total_ativos/80))
+        if paginas_encontradas:
+            total_pag=min(MAX_PAGINAS,max(total_pag,max(paginas_encontradas)))
         try: tabelas=pd.read_html(StringIO(texto))
         except ValueError: tabelas=[]
         candidatos=[]
@@ -93,7 +149,9 @@ def carregar_catalogo():
                 candidatos=parse_catalog_table(tab)
                 if len(candidatos)>=10: break
         catalogo.extend(candidatos)
-        print(f'[CATÁLOGO] página {pagina}/{total_pag}: {len(candidatos)} linhas candidatas',flush=True)
+        unicos_pagina={a['t'] for a in candidatos}
+        print(f'[CATÁLOGO] página {pagina}/{total_pag}: {len(candidatos)} linhas candidatas; '
+              f'{len(unicos_pagina)} tickers extraídos',flush=True)
         if pagina>=total_pag: break
         time.sleep(0.2)
     unicos={}
